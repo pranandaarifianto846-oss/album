@@ -317,7 +317,7 @@
 <button id="musicControl" title="Musik"><span class="note">♪</span></button>
 <audio id="bgAudio" loop></audio>
 
-<!-- Hanya membutuhkan Firebase Firestore (Bebas Biaya & Tanpa Kartu Kredit) -->
+<!-- Firebase SDK -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 
@@ -333,38 +333,73 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
 
-// Fungsi Kompresi Foto agar bisa disimpan langsung di Database Firestore Gratis
-function compressImage(file) {
+// KOMPRESI GAMBAR RAMAH HP (Menggunakan Hardware Decoder Bawaan HP)
+async function compressImage(file) {
+    // 1. Prioritaskan createImageBitmap (sangat cepat & hemat RAM di HP Android)
+    if ('createImageBitmap' in window) {
+        try {
+            const bmp = await createImageBitmap(file);
+            let width = bmp.width;
+            let height = bmp.height;
+            const maxDim = 800; // Ukuran optimal untuk Firestore
+
+            if (width > height && width > maxDim) {
+                height = Math.round((height * maxDim) / width);
+                width = maxDim;
+            } else if (height > maxDim) {
+                width = Math.round((width * maxDim) / height);
+                height = maxDim;
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(bmp, 0, 0, width, height);
+            bmp.close();
+            return canvas.toDataURL('image/jpeg', 0.65);
+        } catch (e) {
+            console.warn("createImageBitmap gagal, beralih ke ObjectURL:", e);
+        }
+    }
+
+    // 2. Cadangan: Menggunakan ObjectURL
     return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = (event) => {
-            const img = new Image();
-            img.src = event.target.result;
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                let width = img.width;
-                let height = img.height;
-                const maxDim = 1000;
+        const img = new Image();
+        const objUrl = URL.createObjectURL(file);
 
-                if (width > height && width > maxDim) {
-                    height = Math.round((height * maxDim) / width);
-                    width = maxDim;
-                } else if (height > maxDim) {
-                    width = Math.round((width * maxDim) / height);
-                    height = maxDim;
-                }
+        img.onload = () => {
+            URL.revokeObjectURL(objUrl);
+            const canvas = document.createElement('canvas');
+            let width = img.width;
+            let height = img.height;
+            const maxDim = 800;
 
-                canvas.width = width;
-                canvas.height = height;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0, width, height);
-                // Kompres kualitas gambar ke 0.7 JPEG (sangat ringan)
-                resolve(canvas.toDataURL('image/jpeg', 0.7));
-            };
-            img.onerror = reject;
+            if (width > height && width > maxDim) {
+                height = Math.round((height * maxDim) / width);
+                width = maxDim;
+            } else if (height > maxDim) {
+                width = Math.round((width * maxDim) / height);
+                height = maxDim;
+            }
+
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', 0.65));
         };
-        reader.onerror = reject;
+
+        img.onerror = () => {
+            URL.revokeObjectURL(objUrl);
+            // 3. Cadangan Terakhir: FileReader biasa
+            const reader = new FileReader();
+            reader.onload = (e) => resolve(e.target.result);
+            reader.onerror = () => reject(new Error("File foto tidak bisa dibaca oleh browser."));
+            reader.readAsDataURL(file);
+        };
+
+        img.src = objUrl;
     });
 }
 
@@ -373,11 +408,11 @@ function fileToBase64(file) {
         const reader = new FileReader();
         reader.readAsDataURL(file);
         reader.onload = () => resolve(reader.result);
-        reader.onerror = reject;
+        reader.onerror = () => reject(new Error("Gagal membaca file lagu."));
     });
 }
 
-/* ================= CRUD Database Firestore ================= */
+/* ================= CRUD Firestore ================= */
 
 async function addMemory(caption, date, photoDataURL) {
     await db.collection('memories').add({
@@ -391,7 +426,6 @@ async function addMemory(caption, date, photoDataURL) {
 async function getAllMemories() {
     const snap = await db.collection('memories').get();
     let data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    // Urutkan berdasarkan waktu
     data.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
     return data;
 }
@@ -502,8 +536,10 @@ form.addEventListener('submit', async function (e) {
         renderGallery();
         burstHearts();
     } catch (err) {
-        alert("Gagal menyimpan: " + err.message);
-        console.error(err);
+        // Penanganan error dengan teks jelas jika terjadi masalah
+        const pesanEror = err?.message || err?.code || String(err);
+        alert("Gagal menyimpan: " + pesanEror);
+        console.error("Detail Error:", err);
     } finally {
         btnSubmit.disabled = false;
         btnSubmit.textContent = "Simpan Kenangan";
@@ -555,11 +591,15 @@ musicInput.addEventListener('change', async () => {
         alert("File musik terlalu besar! Gunakan file MP3 di bawah 1MB.");
         return;
     }
-    const b64 = await fileToBase64(file);
-    await saveSetting('bgMusic', b64);
-    bgAudio.src = b64;
-    bgAudio.play();
-    musicControl.classList.add('spinning');
+    try {
+        const b64 = await fileToBase64(file);
+        await saveSetting('bgMusic', b64);
+        bgAudio.src = b64;
+        bgAudio.play();
+        musicControl.classList.add('spinning');
+    } catch (e) {
+        alert("Gagal memutar musik: " + e.message);
+    }
 });
 
 /* ================= Hitungan Hari Manual ================= */
@@ -629,7 +669,6 @@ function burstHearts() {
     }
 }
 
-// Inisialisasi awal
 cycleQuote();
 setInterval(cycleQuote, 5500);
 setInterval(spawnHeart, 1500);
