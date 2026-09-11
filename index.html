@@ -180,12 +180,13 @@
         transition: transform 0.3s ease;
     }
     .card:hover { transform: rotate(0deg) translateY(-6px) scale(1.02); z-index: 3; }
-    .card img {
+    .card img, .card video {
         width: 100%;
         height: 220px;
         object-fit: cover;
         border-radius: 2px;
         cursor: zoom-in;
+        background: #000;
     }
     .card p {
         font-family: 'Cormorant Garamond', serif;
@@ -193,6 +194,7 @@
         font-size: 1.25rem;
         margin: 14px 4px 2px;
         color: var(--rose-deep);
+        word-break: break-word;
     }
     .card-date {
         display: block;
@@ -213,6 +215,7 @@
         width: 28px;
         height: 28px;
         cursor: pointer;
+        z-index: 2;
     }
 
     #lightbox{
@@ -227,7 +230,7 @@
         cursor: zoom-out;
     }
     #lightbox.show{ display:flex; }
-    #lightbox img{ max-width: 92vw; max-height: 80vh; border-radius: 6px; }
+    #lightbox img, #lightbox video{ max-width: 92vw; max-height: 80vh; border-radius: 6px; }
     #lightboxCaption{
         position:absolute;
         bottom: 30px;
@@ -290,8 +293,8 @@
 <div id="formContainer" class="form-container">
     <h2>Unggah Momen Baru</h2>
     <form id="uploadForm">
-        <label for="fileInput">Pilih Foto</label>
-        <input type="file" id="fileInput" accept="image/*" required>
+        <label for="fileInput">Pilih Foto atau Video</label>
+        <input type="file" id="fileInput" accept="image/*,video/*" required>
 
         <label for="dateInput">Tanggal Momen</label>
         <input type="date" id="dateInput" required>
@@ -333,15 +336,36 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
 
-// KOMPRESI GAMBAR RAMAH HP (Menggunakan Hardware Decoder Bawaan HP)
+// Helper Base64 & Blob
+function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("Gagal membaca file."));
+        reader.readAsDataURL(file);
+    });
+}
+
+function dataURLToBlob(dataURL) {
+    const arr = dataURL.split(',');
+    const mime = arr[0].match(/:(.*?);/)[1];
+    const bstr = atob(arr[1]);
+    let n = bstr.length;
+    const u8arr = new Uint8Array(n);
+    while (n--) {
+        u8arr[n] = bstr.charCodeAt(n);
+    }
+    return new Blob([u8arr], { type: mime });
+}
+
+// Kompres Gambar Otomatis
 async function compressImage(file) {
-    // 1. Prioritaskan createImageBitmap (sangat cepat & hemat RAM di HP Android)
     if ('createImageBitmap' in window) {
         try {
             const bmp = await createImageBitmap(file);
             let width = bmp.width;
             let height = bmp.height;
-            const maxDim = 800; // Ukuran optimal untuk Firestore
+            const maxDim = 800;
 
             if (width > height && width > maxDim) {
                 height = Math.round((height * maxDim) / width);
@@ -358,23 +382,18 @@ async function compressImage(file) {
             ctx.drawImage(bmp, 0, 0, width, height);
             bmp.close();
             return canvas.toDataURL('image/jpeg', 0.65);
-        } catch (e) {
-            console.warn("createImageBitmap gagal, beralih ke ObjectURL:", e);
-        }
+        } catch (e) {}
     }
 
-    // 2. Cadangan: Menggunakan ObjectURL
     return new Promise((resolve, reject) => {
         const img = new Image();
         const objUrl = URL.createObjectURL(file);
-
         img.onload = () => {
             URL.revokeObjectURL(objUrl);
             const canvas = document.createElement('canvas');
             let width = img.width;
             let height = img.height;
             const maxDim = 800;
-
             if (width > height && width > maxDim) {
                 height = Math.round((height * maxDim) / width);
                 width = maxDim;
@@ -382,45 +401,66 @@ async function compressImage(file) {
                 width = Math.round((width * maxDim) / height);
                 height = maxDim;
             }
-
             canvas.width = width;
             canvas.height = height;
             const ctx = canvas.getContext('2d');
             ctx.drawImage(img, 0, 0, width, height);
             resolve(canvas.toDataURL('image/jpeg', 0.65));
         };
-
         img.onerror = () => {
             URL.revokeObjectURL(objUrl);
-            // 3. Cadangan Terakhir: FileReader biasa
-            const reader = new FileReader();
-            reader.onload = (e) => resolve(e.target.result);
-            reader.onerror = () => reject(new Error("File foto tidak bisa dibaca oleh browser."));
-            reader.readAsDataURL(file);
+            fileToBase64(file).then(resolve).catch(reject);
         };
-
         img.src = objUrl;
     });
 }
 
-function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(new Error("Gagal membaca file lagu."));
-    });
-}
+/* ================= CRUD Kenangan (Foto & Video Support) ================= */
 
-/* ================= CRUD Firestore ================= */
+async function addMemory(file, caption, date) {
+    const isVideo = file.type.startsWith('video');
 
-async function addMemory(caption, date, photoDataURL) {
-    await db.collection('memories').add({
-        caption: caption,
-        date: date,
-        fileURL: photoDataURL,
-        createdAt: firebase.firestore.FieldValue.serverTimestamp()
-    });
+    if (isVideo) {
+        // Maksimal ukuran video 15 MB agar tidak memberatkan browser HP
+        if (file.size > 15 * 1024 * 1024) {
+            throw new Error("Ukuran video maksimal 15 MB.");
+        }
+
+        const base64Data = await fileToBase64(file);
+        const CHUNK_SIZE = 400000; // di bawah limit 1MB Firestore
+        const totalChunks = Math.ceil(base64Data.length / CHUNK_SIZE);
+
+        // Buat dokumen utama
+        const docRef = await db.collection('memories').add({
+            type: 'video',
+            caption: caption,
+            date: date,
+            isChunked: true,
+            totalChunks: totalChunks,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Simpan pecahan data video ke subkoleksi
+        const batch = db.batch();
+        for (let i = 0; i < totalChunks; i++) {
+            const chunk = base64Data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+            const chunkRef = docRef.collection('chunks').doc(String(i).padStart(4, '0'));
+            batch.set(chunkRef, { index: i, data: chunk });
+        }
+        await batch.commit();
+
+    } else {
+        // Foto: dikompres sehingga langsung muat dalam 1 dokumen
+        const compressedB64 = await compressImage(file);
+        await db.collection('memories').add({
+            type: 'image',
+            caption: caption,
+            date: date,
+            fileURL: compressedB64,
+            isChunked: false,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+    }
 }
 
 async function getAllMemories() {
@@ -430,7 +470,22 @@ async function getAllMemories() {
     return data;
 }
 
-async function deleteMemoryById(id) {
+// Mengambil file video utuh dari pecahan Firestore
+async function fetchVideoURL(memId) {
+    const snap = await db.collection('memories').doc(memId).collection('chunks').orderBy('index', 'asc').get();
+    let fullBase64 = '';
+    snap.forEach(doc => fullBase64 += doc.data().data);
+    const blob = dataURLToBlob(fullBase64);
+    return URL.createObjectURL(blob);
+}
+
+async function deleteMemoryById(id, isChunked) {
+    if (isChunked) {
+        const snap = await db.collection('memories').doc(id).collection('chunks').get();
+        const batch = db.batch();
+        snap.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+    }
     await db.collection('memories').doc(id).delete();
 }
 
@@ -449,7 +504,7 @@ function formatTanggalIndonesia(dateStr) {
     return isNaN(d.getTime()) ? dateStr : d.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
 }
 
-/* ================= Form & Galeri ================= */
+/* ================= Form & Render Galeri ================= */
 const gallery = document.getElementById('gallery');
 const form = document.getElementById('uploadForm');
 const fileInput = document.getElementById('fileInput');
@@ -475,33 +530,49 @@ async function renderGallery() {
             return;
         }
 
-        memories.reverse().forEach((mem, i) => {
+        for (let i = memories.length - 1; i >= 0; i--) {
+            const mem = memories[i];
             const card = document.createElement('div');
             card.className = 'card';
             card.style.setProperty('--tilt', tilts[i % tilts.length] + 'deg');
 
+            let mediaHTML = '';
+            if (mem.type === 'video') {
+                mediaHTML = `<video controls playsinline preload="metadata" id="video-${mem.id}"></video>`;
+            } else {
+                mediaHTML = `<img src="${mem.fileURL}" alt="Kenangan" loading="lazy">`;
+            }
+
             card.innerHTML = `
                 <span class="pin">📌</span>
                 <button class="btn-delete" title="Hapus">×</button>
-                <img src="${mem.fileURL}" alt="Kenangan" loading="lazy">
+                ${mediaHTML}
                 <p>${escapeHtml(mem.caption || '')}</p>
                 <span class="card-date">${formatTanggalIndonesia(mem.date)}</span>
             `;
 
             card.querySelector('.btn-delete').addEventListener('click', (e) => {
                 e.stopPropagation();
-                onDelete(mem.id);
+                onDelete(mem.id, mem.isChunked);
             });
 
-            card.querySelector('img').addEventListener('click', () => {
-                openLightbox(mem.fileURL, mem.caption);
-            });
+            if (mem.type === 'video') {
+                // Ambil video dari pecahan database
+                fetchVideoURL(mem.id).then(url => {
+                    const v = card.querySelector(`#video-${mem.id}`);
+                    if (v) v.src = url;
+                });
+            } else {
+                card.querySelector('img').addEventListener('click', () => {
+                    openLightbox(mem.fileURL, mem.caption, false);
+                });
+            }
 
             gallery.appendChild(card);
-        });
+        }
     } catch (e) {
         console.error(e);
-        gallery.innerHTML = "<p class='empty-state'>Periksa tab Rules Firestore Anda. Pastikan allow read, write: if true;</p>";
+        gallery.innerHTML = "<p class='empty-state'>Gagal memuat galeri. Periksa koneksi internet Anda.</p>";
     }
 }
 
@@ -511,9 +582,9 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
-async function onDelete(id) {
+async function onDelete(id, isChunked) {
     if (confirm('Hapus kenangan ini?')) {
-        await deleteMemoryById(id);
+        await deleteMemoryById(id, isChunked);
         renderGallery();
     }
 }
@@ -524,22 +595,19 @@ form.addEventListener('submit', async function (e) {
     if (!file) return;
 
     btnSubmit.disabled = true;
-    btnSubmit.textContent = "Mengompres & Menyimpan...";
+    btnSubmit.textContent = file.type.startsWith('video') ? "Mengunggah Video..." : "Mengompres & Menyimpan...";
 
     try {
-        const compressedBase64 = await compressImage(file);
         const tgl = dateInput.value || new Date().toISOString().slice(0, 10);
-        await addMemory(captionInput.value, tgl, compressedBase64);
+        await addMemory(file, captionInput.value, tgl);
 
         form.reset();
         toggleForm();
         renderGallery();
         burstHearts();
     } catch (err) {
-        // Penanganan error dengan teks jelas jika terjadi masalah
-        const pesanEror = err?.message || err?.code || String(err);
-        alert("Gagal menyimpan: " + pesanEror);
-        console.error("Detail Error:", err);
+        alert("Gagal menyimpan: " + (err.message || String(err)));
+        console.error(err);
     } finally {
         btnSubmit.disabled = false;
         btnSubmit.textContent = "Simpan Kenangan";
@@ -551,54 +619,30 @@ const lightbox = document.getElementById('lightbox');
 const lightboxContent = document.getElementById('lightboxContent');
 const lightboxCaption = document.getElementById('lightboxCaption');
 
-function openLightbox(url, caption) {
-    lightboxContent.innerHTML = `<img src="${url}">`;
+function openLightbox(url, caption, isVideo) {
+    lightboxContent.innerHTML = isVideo
+        ? `<video src="${url}" controls autoplay></video>`
+        : `<img src="${url}">`;
     lightboxCaption.textContent = caption || '';
     lightbox.classList.add('show');
 }
 lightbox.addEventListener('click', () => lightbox.classList.remove('show'));
 
-/* ================= Musik Cloud Database (Sistem Chunking) ================= */
+/* ================= Musik Cloud Database ================= */
 const bgAudio = document.getElementById('bgAudio');
 const musicControl = document.getElementById('musicControl');
 const musicInput = document.getElementById('musicInput');
 
-// Fungsi mengubah file audio menjadi Base64
-function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(new Error("Gagal membaca file lagu."));
-        reader.readAsDataURL(file);
-    });
-}
-
-// Fungsi mengubah Base64 kembali menjadi file audio utuh (Blob)
-function dataURLToBlob(dataURL) {
-    const arr = dataURL.split(',');
-    const mime = arr[0].match(/:(.*?);/)[1];
-    const bstr = atob(arr[1]);
-    let n = bstr.length;
-    const u8arr = new Uint8Array(n);
-    while (n--) {
-        u8arr[n] = bstr.charCodeAt(n);
-    }
-    return new Blob([u8arr], { type: mime });
-}
-
-// 1. Simpan lagu ukuran besar ke Database Firestore (Dipecah per ~400KB)
 async function simpanLaguKeDatabase(file) {
-    const CHUNK_SIZE = 400000; // Ukuran aman di bawah batas 1MB Firestore
+    const CHUNK_SIZE = 400000;
     const base64Data = await fileToBase64(file);
     const totalChunks = Math.ceil(base64Data.length / CHUNK_SIZE);
 
-    // Hapus lagu lama yang ada di database agar tidak menumpuk
     const oldDocs = await db.collection('music_chunks').get();
     const batchDelete = db.batch();
     oldDocs.forEach(doc => batchDelete.delete(doc.ref));
     await batchDelete.commit();
 
-    // Simpan pecahan baru ke Firestore
     const batch = db.batch();
     for (let i = 0; i < totalChunks; i++) {
         const chunk = base64Data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
@@ -607,7 +651,6 @@ async function simpanLaguKeDatabase(file) {
     }
     await batch.commit();
 
-    // Simpan informasi total pecahan
     await db.collection('settings').doc('music_meta').set({
         totalChunks: totalChunks,
         name: file.name,
@@ -615,18 +658,14 @@ async function simpanLaguKeDatabase(file) {
     });
 }
 
-// 2. Ambil dan sambung kembali lagu dari Database Firestore
 async function loadMusic() {
     try {
         const metaDoc = await db.collection('settings').doc('music_meta').get();
         if (!metaDoc.exists) return;
 
-        // Ambil semua pecahan dari cloud dan urutkan
         const snap = await db.collection('music_chunks').orderBy('index', 'asc').get();
         let fullBase64 = '';
-        snap.forEach(doc => {
-            fullBase64 += doc.data().data;
-        });
+        snap.forEach(doc => fullBase64 += doc.data().data);
 
         if (fullBase64) {
             const blob = dataURLToBlob(fullBase64);
@@ -634,7 +673,6 @@ async function loadMusic() {
             bgAudio.play().then(() => {
                 musicControl.classList.add('spinning');
             }).catch(() => {
-                // Di HP terkadang audio butuh sentuhan layar pertama kali
                 document.body.addEventListener('click', () => {
                     if (bgAudio.paused) {
                         bgAudio.play();
@@ -643,17 +681,11 @@ async function loadMusic() {
                 }, { once: true });
             });
         }
-    } catch (e) {
-        console.warn("Gagal memuat musik dari database cloud:", e);
-    }
+    } catch (e) {}
 }
 
-// Tombol kontrol putar / jeda musik
 musicControl.addEventListener('click', () => {
-    if (!bgAudio.src) {
-        musicInput.click();
-        return;
-    }
+    if (!bgAudio.src) { musicInput.click(); return; }
     if (bgAudio.paused) {
         bgAudio.play();
         musicControl.classList.add('spinning');
@@ -663,34 +695,26 @@ musicControl.addEventListener('click', () => {
     }
 });
 
-// Event saat memilih file MP3 baru
 musicInput.addEventListener('change', async () => {
     const file = musicInput.files[0];
     if (!file) return;
-
-    // Batas wajar file lagu agar tidak terlalu berat saat diproses browser HP
     if (file.size > 9 * 1024 * 1024) {
         alert("Ukuran file lagu maksimal 9 MB.");
         return;
     }
-
     try {
-        alert("Sedang mengunggah lagu ke database cloud... Mohon tunggu beberapa detik.");
         await simpanLaguKeDatabase(file);
-        
-        // Putar langsung
         const base64 = await fileToBase64(file);
         const blob = dataURLToBlob(base64);
         bgAudio.src = URL.createObjectURL(blob);
         bgAudio.play();
         musicControl.classList.add('spinning');
-        
-        alert("Lagu berhasil disimpan ke database cloud! 🎵\nSekarang lagu ini akan otomatis berputar di perangkat lain juga.");
+        alert("Lagu berhasil disimpan ke database cloud! 🎵");
     } catch (e) {
-        alert("Gagal menyimpan lagu ke database: " + e.message);
-        console.error(e);
+        alert("Gagal menyimpan lagu: " + e.message);
     }
 });
+
 /* ================= Hitungan Hari Manual ================= */
 const counterWrap = document.getElementById('counterWrap');
 const counterNumber = document.getElementById('counterNumber');
@@ -713,7 +737,7 @@ counterWrap.addEventListener('click', async () => {
     }
 });
 
-/* ================= Animasi & Hiasan ================= */
+/* ================= Animasi ================= */
 const quotes = [
     'Di setiap detik bersamamu, waktu terasa berjalan lebih lembut.',
     'Kenangan kecil ini, kusimpan sebagai harta yang paling berharga.',
