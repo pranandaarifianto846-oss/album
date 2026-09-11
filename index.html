@@ -558,23 +558,102 @@ function openLightbox(url, caption) {
 }
 lightbox.addEventListener('click', () => lightbox.classList.remove('show'));
 
-/* ================= Musik ================= */
+/* ================= Musik Cloud Database (Sistem Chunking) ================= */
 const bgAudio = document.getElementById('bgAudio');
 const musicControl = document.getElementById('musicControl');
 const musicInput = document.getElementById('musicInput');
 
-async function loadMusic() {
-    try {
-        const music = await getSetting('bgMusic');
-        if (music) {
-            bgAudio.src = music;
-            bgAudio.play().then(() => musicControl.classList.add('spinning')).catch(() => {});
-        }
-    } catch (e) {}
+// Fungsi mengubah file audio menjadi Base64
+function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("Gagal membaca file lagu."));
+        reader.readAsDataURL(file);
+    });
 }
 
+// Fungsi mengubah Base64 kembali menjadi file audio utuh (Blob)
+function dataURLToBlob(dataURL) {
+    const arr = dataURL.split(',');
+    const mime = arr[0].match(/:(.*?);/)[1];
+    const bstr = atob(arr[1]);
+    let n = bstr.length;
+    const u8arr = new Uint8Array(n);
+    while (n--) {
+        u8arr[n] = bstr.charCodeAt(n);
+    }
+    return new Blob([u8arr], { type: mime });
+}
+
+// 1. Simpan lagu ukuran besar ke Database Firestore (Dipecah per ~400KB)
+async function simpanLaguKeDatabase(file) {
+    const CHUNK_SIZE = 400000; // Ukuran aman di bawah batas 1MB Firestore
+    const base64Data = await fileToBase64(file);
+    const totalChunks = Math.ceil(base64Data.length / CHUNK_SIZE);
+
+    // Hapus lagu lama yang ada di database agar tidak menumpuk
+    const oldDocs = await db.collection('music_chunks').get();
+    const batchDelete = db.batch();
+    oldDocs.forEach(doc => batchDelete.delete(doc.ref));
+    await batchDelete.commit();
+
+    // Simpan pecahan baru ke Firestore
+    const batch = db.batch();
+    for (let i = 0; i < totalChunks; i++) {
+        const chunk = base64Data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+        const ref = db.collection('music_chunks').doc(String(i).padStart(4, '0'));
+        batch.set(ref, { index: i, data: chunk });
+    }
+    await batch.commit();
+
+    // Simpan informasi total pecahan
+    await db.collection('settings').doc('music_meta').set({
+        totalChunks: totalChunks,
+        name: file.name,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+}
+
+// 2. Ambil dan sambung kembali lagu dari Database Firestore
+async function loadMusic() {
+    try {
+        const metaDoc = await db.collection('settings').doc('music_meta').get();
+        if (!metaDoc.exists) return;
+
+        // Ambil semua pecahan dari cloud dan urutkan
+        const snap = await db.collection('music_chunks').orderBy('index', 'asc').get();
+        let fullBase64 = '';
+        snap.forEach(doc => {
+            fullBase64 += doc.data().data;
+        });
+
+        if (fullBase64) {
+            const blob = dataURLToBlob(fullBase64);
+            bgAudio.src = URL.createObjectURL(blob);
+            bgAudio.play().then(() => {
+                musicControl.classList.add('spinning');
+            }).catch(() => {
+                // Di HP terkadang audio butuh sentuhan layar pertama kali
+                document.body.addEventListener('click', () => {
+                    if (bgAudio.paused) {
+                        bgAudio.play();
+                        musicControl.classList.add('spinning');
+                    }
+                }, { once: true });
+            });
+        }
+    } catch (e) {
+        console.warn("Gagal memuat musik dari database cloud:", e);
+    }
+}
+
+// Tombol kontrol putar / jeda musik
 musicControl.addEventListener('click', () => {
-    if (!bgAudio.src) { musicInput.click(); return; }
+    if (!bgAudio.src) {
+        musicInput.click();
+        return;
+    }
     if (bgAudio.paused) {
         bgAudio.play();
         musicControl.classList.add('spinning');
@@ -584,24 +663,34 @@ musicControl.addEventListener('click', () => {
     }
 });
 
+// Event saat memilih file MP3 baru
 musicInput.addEventListener('change', async () => {
     const file = musicInput.files[0];
     if (!file) return;
-    if (file.size > 1024 * 1024) {
-        alert("File musik terlalu besar! Gunakan file MP3 di bawah 1MB.");
+
+    // Batas wajar file lagu agar tidak terlalu berat saat diproses browser HP
+    if (file.size > 9 * 1024 * 1024) {
+        alert("Ukuran file lagu maksimal 9 MB.");
         return;
     }
+
     try {
-        const b64 = await fileToBase64(file);
-        await saveSetting('bgMusic', b64);
-        bgAudio.src = b64;
+        alert("Sedang mengunggah lagu ke database cloud... Mohon tunggu beberapa detik.");
+        await simpanLaguKeDatabase(file);
+        
+        // Putar langsung
+        const base64 = await fileToBase64(file);
+        const blob = dataURLToBlob(base64);
+        bgAudio.src = URL.createObjectURL(blob);
         bgAudio.play();
         musicControl.classList.add('spinning');
+        
+        alert("Lagu berhasil disimpan ke database cloud! 🎵\nSekarang lagu ini akan otomatis berputar di perangkat lain juga.");
     } catch (e) {
-        alert("Gagal memutar musik: " + e.message);
+        alert("Gagal menyimpan lagu ke database: " + e.message);
+        console.error(e);
     }
 });
-
 /* ================= Hitungan Hari Manual ================= */
 const counterWrap = document.getElementById('counterWrap');
 const counterNumber = document.getElementById('counterNumber');
